@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <string.h>
 #include <ftdi.h>
 
 void setup(struct ftdi_context *ftdi)
@@ -25,22 +27,26 @@ void end(struct ftdi_context *ftdi)
 
 void send_command(struct ftdi_context *ftdi,
 	unsigned char *cmd, unsigned int cmd_len,
-	unsigned char *buf, unsigned int buf_len, int *len)
+	unsigned char *buf, unsigned int buf_len, int *len, int cr)
 {
 	int i;
+	int idx = 0;
 	int num;
 	for (i = 0; i < cmd_len; i++) {
+		printf("cmd[%d] %02X\n", i, cmd[i]);
 		ftdi_setflowctrl(ftdi, 0);
 		ftdi_write_data(ftdi, &cmd[i], 1);
 	}
-	num = ftdi_read_data(ftdi, buf, 256);
-	for (i = 0; i < num; i++) {
-		if (i == 2 || ((i - 2) % 20 == 0)) {
-			printf("\n");
+	while((num = ftdi_read_data(ftdi, buf, buf_len)) > 0) {
+		for (i = 0; i < num; i++) {
+			if (idx == 2 || ((idx - 2) % cr == 0)) {
+				printf("\n");
+			}
+			printf("%02X ", buf[i]);
+			idx++;
 		}
-		printf("%02X ", buf[i]);
 	}
-	*len = num;
+	*len = idx;
 	printf("\n");
 }
 
@@ -52,7 +58,7 @@ void read_version(struct ftdi_context *ftdi)
 	begin(ftdi);
 	buf[0] = 'V';
 	buf[1] = 'X';
-	send_command(ftdi, buf, 2, buf, 256, &num);
+	send_command(ftdi, buf, 2, buf, 256, &num, 32);
 	printf("Version %d.%d.%d.%d\n\n", buf[3], buf[4], buf[5], buf[6]);
 	end(ftdi);
 }
@@ -67,13 +73,67 @@ void read_product(struct ftdi_context *ftdi)
 
 	buf[0] = 'P';
 	buf[1] = 'X';
-	send_command(ftdi, buf, 2, buf, 256, &num);
+	send_command(ftdi, buf, 2, buf, 256, &num, 32);
 	printf("Product %d\n\n", buf[3]);
 
 	end(ftdi);
 }
 
-void read_list(struct ftdi_context *ftdi)
+typedef struct {
+	unsigned int no;
+	unsigned int npoints;
+	struct tm start;
+	struct tm end;
+	unsigned char finger_print[14];
+} track;
+
+void read_list(struct ftdi_context *ftdi, track **tracks, int *ntracks)
+{
+	int i;
+	int num;
+	unsigned char buf[4096];
+	int n;
+	char fmt1[64];
+	char fmt2[64];
+	track *trks;
+
+	begin(ftdi);
+
+	buf[0] = 'O';
+	buf[1] = 'X';
+
+	send_command(ftdi, buf, 2, buf, 4096, &num, 20);
+
+	*ntracks = n = (num - 2) / 20;
+	*tracks = trks = (track *)malloc(sizeof(track) * n);
+	for (i = 0; i < n; ++i) {
+		int b = 20 * i + 2;
+		trks[i].no = buf[b + 1];
+		trks[i].npoints = buf[b + 2] + (buf[b + 3] << 8)
+			+ (buf[b + 4] << 16) + (buf[b + 5] << 24);
+		trks[i].start.tm_year = buf[b +  6] + 100;
+		trks[i].start.tm_mon  = buf[b +  7] - 1;
+		trks[i].start.tm_mday = buf[b +  8];
+		trks[i].start.tm_hour = buf[b +  9];
+		trks[i].start.tm_min  = buf[b + 10];
+		trks[i].start.tm_sec  = buf[b + 11];
+		trks[i].end.tm_year = buf[b + 13] + 100;
+		trks[i].end.tm_mon  = buf[b + 14] - 1;
+		trks[i].end.tm_mday = buf[b + 15];
+		trks[i].end.tm_hour = buf[b + 16];
+		trks[i].end.tm_min  = buf[b + 17];
+		trks[i].end.tm_sec  = buf[b + 18];
+		memcpy(trks[i].finger_print, &buf[b + 6], 14);
+
+		strftime(fmt1, 64, "%F %T", &trks[i].start);
+		strftime(fmt2, 64, "%F %T", &trks[i].end);
+		printf("Log %4d  %6d  %s %s\n", trks[i].no, trks[i].npoints, fmt1, fmt2);
+	}
+
+	end(ftdi);
+}
+
+void read_track(struct ftdi_context *ftdi, unsigned char *finger_print, int idx)
 {
 	int i;
 	int num;
@@ -81,37 +141,14 @@ void read_list(struct ftdi_context *ftdi)
 
 	begin(ftdi);
 
-	buf[0] = 'O';
-	buf[1] = 'X';
-
-	send_command(ftdi, buf, 2, buf, 4096, &num);
-
-	int ntracks = (num - 2) / 20;
-	for (i = 0; i < ntracks; ++i) {
-		int b = 20 * i + 2;
-		int no = buf[b + 1];
-		int npoints = buf[b + 2] + (buf[b + 3] << 8)
-			+ (buf[b + 4] << 16) + (buf[b + 5] << 24);
-		int sy = buf[b + 6] + 2000;
-		int sm = buf[b + 7];
-		int sd = buf[b + 8];
-		int sh = buf[b + 9];
-		int si = buf[b + 10];
-		int ss = buf[b + 11];
-		int ey = buf[b + 13] + 2000;
-		int em = buf[b + 14];
-		int ed = buf[b + 15];
-		int eh = buf[b + 16];
-		int ei = buf[b + 17];
-		int es = buf[b + 18];
-		printf("Log %4d  %6d"
-			"  %04d-%02d-%02d %02d:%02d:%02d" 
-			"  %04d-%02d-%02d %02d:%02d:%02d" 
-			"\n",
-			no, npoints,
-			sy, sm, sd, sh, si, ss,
-			ey, em, ed, eh, ei, es);
+	for (i = 0; i < 14; ++i) {
+		printf("%02X ", finger_print[i]);
 	}
+	printf("\n");
+	buf[0] = 'T';
+	buf[1] = 'X';
+	memcpy(&buf[2], finger_print, 14);
+	send_command(ftdi, buf, 16, buf, 4096, &num, 32);
 
 	end(ftdi);
 }
@@ -123,6 +160,9 @@ int main(int argc, char *argv[])
 	struct ftdi_context *ftdi;
 	unsigned int chipid;
 	unsigned char buf[256];
+	track *tracks;
+	int ntracks;
+
 
 	ftdi = ftdi_new();
 	ret = ftdi_usb_open(ftdi, 0x0403, 0xB70A);
@@ -139,9 +179,24 @@ int main(int argc, char *argv[])
 
 	setup(ftdi);
 
+	ftdi_setrts(ftdi, 1);
+	while((ret = ftdi_read_data(ftdi, buf, 256)) > 0) {
+		for(i = 0; i < ret; ++i)
+			printf("%02X ", buf[i]);
+	}
+	ftdi_setrts(ftdi, 0);
+
 	read_version(ftdi);
 	read_product(ftdi);
-	read_list(ftdi);
+
+	read_list(ftdi, &tracks, &ntracks);
+
+	if (argc > 1) {
+		i = atoi(argv[1]);
+		printf("tracks[%d].no=%d\n", i, tracks[i].no);
+		read_track(ftdi, tracks[i].finger_print, i);
+	}
+	free(tracks);
 
 	ftdi_usb_close(ftdi);
 	ftdi_free(ftdi);
