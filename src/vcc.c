@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <math.h>
+#include <float.h>
 #include <string.h>
 #include <ftdi.h>
 
@@ -133,24 +135,114 @@ void read_list(struct ftdi_context *ftdi, track **tracks, int *ntracks)
 	end(ftdi);
 }
 
-void read_track(struct ftdi_context *ftdi, unsigned char *finger_print, int idx)
+typedef struct {
+	struct tm time_stamp;
+	float latitude;
+	float longitude;
+	float speed;
+	float heading;
+} point;
+
+float float_decode(unsigned char *d)
+{
+	unsigned int base = 0x80 + (0x7F & d[1]);
+	base = (base << 8) + d[2];
+	base = (base << 8) + d[3];
+	float ret = (float) (base) * powf(2.0f, d[0] - 150.0f);
+	if (0x80 & d[1]) {
+		ret = - ret;
+	}
+	return ret;
+}
+
+void read_track_points(struct ftdi_context *ftdi, track* trk, int idx)
 {
 	int i;
+	char fmt[64];
+	char name[64];
 	int num;
-	unsigned char buf[4096];
+	int sz = 32 * trk->npoints + 2;
+	unsigned char *buf = (unsigned char*)malloc(sz);
+	point *points = (point*) malloc(sizeof(point) * trk->npoints);
 
 	begin(ftdi);
 
 	for (i = 0; i < 14; ++i) {
-		printf("%02X ", finger_print[i]);
+		printf("%02X ", trk->finger_print[i]);
 	}
 	printf("\n");
 	buf[0] = 'T';
 	buf[1] = 'X';
-	memcpy(&buf[2], finger_print, 14);
-	send_command(ftdi, buf, 16, buf, 4096, &num, 32);
+	memcpy(&buf[2], trk->finger_print, 14);
+	send_command(ftdi, buf, 16, buf, sz, &num, 32);
 
+
+	float minLatitude = FLT_MAX;
+	float maxLatitude = - FLT_MAX;
+	float minLongitude = FLT_MAX;
+	float maxLongitude = - FLT_MAX;
+
+	printf("num=%d\n", num);
+	for (i = 0; i < trk->npoints; ++i) {
+		int b = 32 * i + 2;
+		point *pt = &points[i];
+		pt->time_stamp.tm_year = buf[b    ] + 100;
+		pt->time_stamp.tm_mon  = buf[b + 1] - 1;
+		pt->time_stamp.tm_mday = buf[b + 2];
+		pt->time_stamp.tm_hour = buf[b + 3];
+		pt->time_stamp.tm_min  = buf[b + 4];
+		pt->time_stamp.tm_sec  = buf[b + 5];
+		pt->latitude  = float_decode(&buf[b + 7]);
+		pt->longitude = float_decode(&buf[b + 11]);
+		pt->speed     = float_decode(&buf[b + 15]);
+		pt->heading   = float_decode(&buf[b + 19]);
+
+		minLatitude  = fmin(minLatitude,  pt->latitude);
+		maxLatitude  = fmax(maxLatitude,  pt->latitude);
+		minLongitude = fmin(minLongitude, pt->longitude);
+		maxLongitude = fmax(maxLongitude, pt->longitude);
+	}
+	free(buf);
 	end(ftdi);
+
+
+	time_t t = timegm(&trk->start);
+	strftime(name, 64, "%y%m%d_%H%M%S.vcc", localtime(&t));
+	FILE *fp = fopen(name, "w+");
+	name[0] = 0xEF;
+	name[1] = 0xBB;
+	name[2] = 0xBF;
+	fwrite(name, 3, 1, fp);
+
+	strftime(name, 64, "%y%m%d_%H%M%S", localtime(&t));
+	t = time(NULL);
+	strftime(fmt, 64, "%FT%T.0000000%z", localtime(&t));
+	fprintf(fp, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n");
+	fprintf(fp, "<VelocitekControlCenter"
+		" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""
+		" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\""
+		" createdOn=\"%s\""
+		" xmlns=\"http://www.velocitekspeed.com/VelocitekControlCenter\">\r\n",
+			fmt);
+	fprintf(fp, "  <CapturedTrack name=\"%s\" downloadedOn=\"%s\" numberTrkpts=\"%d\">\r\n", name, fmt, trk->npoints);
+	fprintf(fp, "    <MinLatitude>%.15f</MinLatitude>\r\n",   minLatitude);
+	fprintf(fp, "    <MaxLatitude>%.15f</MaxLatitude>\r\n",   maxLatitude);
+	fprintf(fp, "    <MinLongitude>%.15f</MinLongitude>\r\n", minLongitude);
+	fprintf(fp, "    <MaxLongitude>%.15f</MaxLongitude>\r\n", maxLongitude);
+	fprintf(fp, "    <DeviceInfo ftdiSerialNumber=\"%s\" />\r\n", "VP005594");
+	fprintf(fp, "    <Trackpoints>\r\n");
+	for (i = 0; i < trk->npoints; ++i) {
+		point *pt = &points[i];
+		t = timegm(&pt->time_stamp);
+		strftime(fmt, 64, "%FT%T%z", localtime(&t));
+		fprintf(fp, "      <Trackpoint dateTime=\"%s\" heading=\"%.2f\" speed=\"%.3f\""
+				" latitude=\"%.15f\" longitude=\"%.15f\" />\r\n",
+				fmt, pt->heading, pt->speed, pt->latitude, pt->longitude);
+	}
+	fprintf(fp, "    </Trackpoints>\r\n");
+	fprintf(fp, "  </CapturedTrack>\r\n");
+	fprintf(fp, "</VelocitekControlCenter>\r\n");
+	fclose(fp);
 }
 
 int main(int argc, char *argv[])
@@ -194,7 +286,7 @@ int main(int argc, char *argv[])
 	if (argc > 1) {
 		i = atoi(argv[1]);
 		printf("tracks[%d].no=%d\n", i, tracks[i].no);
-		read_track(ftdi, tracks[i].finger_print, i);
+		read_track_points(ftdi, &tracks[i], i);
 	}
 	free(tracks);
 
